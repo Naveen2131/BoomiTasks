@@ -1,0 +1,88 @@
+name: Deploy to Boomi TEST
+
+on:
+  push:
+    branches:
+      - test
+    paths:
+      - 'configs/components.json'   # Only triggers when THIS file changes
+
+jobs:
+  deploy-to-test:
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Read Components Config
+        id: read_config
+        run: |
+          echo "Reading components.json..."
+          cat configs/components.json
+
+      - name: Deploy All Components to TEST
+        run: |
+          ACCOUNT_ID="${{ secrets.BOOMI_ACCOUNT_ID }}"
+          API_TOKEN="${{ secrets.BOOMI_API_TOKEN }}"
+          ENV_ID="${{ secrets.BOOMI_TEST_ENV_ID }}"
+
+          # Loop through each component in the config file
+          COMPONENTS=$(cat configs/components.json | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          for c in data['components']:
+              print(c['componentId'] + '|' + c['packageVersion'] + '|' + c['notes'] + '|' + c['name'])
+          ")
+
+          while IFS='|' read -r COMPONENT_ID VERSION NOTES NAME; do
+            echo "--------------------------------------------"
+            echo "   Deploying: $NAME"
+            echo "   Component ID : $COMPONENT_ID"
+            echo "   Version      : $VERSION"
+            echo "   Environment  : TEST"
+
+            # Step 1: Create Packaged Component
+            echo " Creating package..."
+            PKG_RESPONSE=$(curl -s -X POST \
+              "https://api.boomi.com/api/rest/v1/${ACCOUNT_ID}/PackagedComponent" \
+              -H "Authorization: Bearer ${API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"componentId\": \"${COMPONENT_ID}\",
+                \"packageVersion\": \"${VERSION}\",
+                \"notes\": \"${NOTES} | GitHub Run #${{ github.run_number }}\"
+              }")
+
+            echo "Package Response: $PKG_RESPONSE"
+
+            PACKAGE_ID=$(echo $PKG_RESPONSE | python3 -c \
+              "import sys,json; d=json.load(sys.stdin); print(d.get('packageId',''))")
+
+            if [ -z "$PACKAGE_ID" ]; then
+              echo " Failed to create package for $NAME. Skipping..."
+              continue
+            fi
+
+            echo " Package created: $PACKAGE_ID"
+
+            # Step 2: Deploy Package to TEST Environment
+            echo " Deploying to TEST..."
+            DEPLOY_RESPONSE=$(curl -s -X POST \
+              "https://api.boomi.com/api/rest/v1/${ACCOUNT_ID}/DeployedPackage" \
+              -H "Authorization: Bearer ${API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"environmentId\": \"${ENV_ID}\",
+                \"packageId\": \"${PACKAGE_ID}\",
+                \"notes\": \"Auto-deployed to TEST via GitHub Actions\"
+              }")
+
+            echo "Deploy Response: $DEPLOY_RESPONSE"
+            echo " $NAME deployed to TEST successfully!"
+            sleep 0.3   # Stay within Boomi API rate limit
+
+          done <<< "$COMPONENTS"
+
+          echo "============================================"
+          echo " All components deployed to TEST!"
