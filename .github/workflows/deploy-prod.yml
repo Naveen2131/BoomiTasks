@@ -1,0 +1,86 @@
+name: Deploy to Boomi PROD
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'configs/components.json'   # Only triggers when THIS file changes
+
+jobs:
+  deploy-to-prod:
+    runs-on: ubuntu-latest
+    environment: production         # ← Manual approval gate for PROD
+
+    steps:
+
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Read Components Config
+        run: |
+          echo "Components to be deployed to PROD:"
+          cat configs/components.json
+
+      - name: Deploy All Components to PROD
+        run: |
+          ACCOUNT_ID="${{ secrets.BOOMI_ACCOUNT_ID }}"
+          API_TOKEN="${{ secrets.BOOMI_API_TOKEN }}"
+          ENV_ID="${{ secrets.BOOMI_PROD_ENV_ID }}"
+
+          COMPONENTS=$(cat configs/components.json | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          for c in data['components']:
+              print(c['componentId'] + '|' + c['packageVersion'] + '|' + c['notes'] + '|' + c['name'])
+          ")
+
+          while IFS='|' read -r COMPONENT_ID VERSION NOTES NAME; do
+            echo "--------------------------------------------"
+            echo "🔧 Deploying: $NAME"
+            echo "   Component ID : $COMPONENT_ID"
+            echo "   Version      : $VERSION"
+            echo "   Environment  : PROD"
+
+            # Step 1: Create Packaged Component
+            echo " Creating package..."
+            PKG_RESPONSE=$(curl -s -X POST \
+              "https://api.boomi.com/api/rest/v1/${ACCOUNT_ID}/PackagedComponent" \
+              -H "Authorization: Bearer ${API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"componentId\": \"${COMPONENT_ID}\",
+                \"packageVersion\": \"${VERSION}\",
+                \"notes\": \"${NOTES} | GitHub Run #${{ github.run_number }}\"
+              }")
+
+            PACKAGE_ID=$(echo $PKG_RESPONSE | python3 -c \
+              "import sys,json; d=json.load(sys.stdin); print(d.get('packageId',''))")
+
+            if [ -z "$PACKAGE_ID" ]; then
+              echo " Failed to create package for $NAME. Skipping..."
+              continue
+            fi
+
+            echo " Package created: $PACKAGE_ID"
+
+            # Step 2: Deploy to PROD
+            echo " Deploying to PROD..."
+            DEPLOY_RESPONSE=$(curl -s -X POST \
+              "https://api.boomi.com/api/rest/v1/${ACCOUNT_ID}/DeployedPackage" \
+              -H "Authorization: Bearer ${API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"environmentId\": \"${ENV_ID}\",
+                \"packageId\": \"${PACKAGE_ID}\",
+                \"notes\": \"Auto-deployed to PROD via GitHub Actions\"
+              }")
+
+            echo "Deploy Response: $DEPLOY_RESPONSE"
+            echo " $NAME deployed to PROD!"
+            sleep 0.3
+
+          done <<< "$COMPONENTS"
+
+          echo "============================================"
+          echo "All components deployed to PROD!"
